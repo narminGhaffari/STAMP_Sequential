@@ -133,23 +133,29 @@ class SKLearnEncoder(Protocol):
 
 
 class EncodedDataset(MapDataset):
-    def __init__(self, encode: SKLearnEncoder, values: Sequence[Any]):
+    def __init__(self, encode: Optional[SKLearnEncoder], values: Sequence[Any], target_type=torch.float32):
         """A dataset which first encodes its input data.
 
-        This class is can be useful with classes such as fastai, where the
-        encoder is saved as part of the model.
-
         Args:
-            encode:  an sklearn encoding to encode the data with.
-            values:  data to encode.
+            encode:  An sklearn encoder to encode the data with, or None if no encoding is needed.
+            values:  Data to encode.
+            target_type: The desired torch dtype for the output tensor (Float or Long).
         """
-        super().__init__(self._unsqueeze_to_float32, values)
+        super().__init__(self._convert_to_tensor, values)
         self.encode = encode
+        self.target_type = target_type  # Set the desired tensor type for targets
 
-    def _unsqueeze_to_float32(self, x):
-        return torch.tensor(
-            self.encode.transform(np.array(x).reshape(1, -1)),
-            dtype=torch.float32)
+    def _convert_to_tensor(self, x):
+        # Apply encoding if an encoder is provided
+        if self.encode is not None:
+            x = self.encode.transform(np.array(x).reshape(1, -1))
+        else:
+            # Convert to integer if `x` contains string representations of numbers
+            x = np.array(x, dtype=int).reshape(1, -1)
+        
+        # Return tensor with the specified type (Float or Long)
+        return torch.tensor(x, dtype=self.target_type)
+
 
 @dataclass
 class BagDataset(Dataset):
@@ -205,13 +211,17 @@ def make_dataset(
     targets: Tuple[SKLearnEncoder, Sequence[Any]],
     add_features: Optional[Iterable[Tuple[Any, Sequence[Any]]]] = None,
     bag_size: Optional[int] = None,
+    target_type: torch.dtype = torch.float32  # Default to Float for binary classification
 ) -> MapDataset:
     if add_features:
         return _make_multi_input_dataset(
-            bags=bags, targets=targets, add_features=add_features, bag_size=bag_size)
+            bags=bags, targets=targets, add_features=add_features, bag_size=bag_size, target_type=target_type
+        )
     else:
         return _make_basic_dataset(
-            bags=bags, target_enc=targets[0], targs=targets[1], bag_size=bag_size)
+            bags=bags, targs=targets, bag_size=bag_size, target_type=target_type
+        )
+
 
 def get_target_enc(mil_learn):
     return mil_learn.dls.train.dataset._datasets[-1].encode
@@ -220,17 +230,16 @@ def get_target_enc(mil_learn):
 def _make_basic_dataset(
     *,
     bags: Sequence[Iterable[Path]],
-    target_enc: SKLearnEncoder,
     targs: Sequence[Any],
     bag_size: Optional[int] = None,
+    target_type: torch.dtype = torch.float32  # Default to Float for binary classification
 ) -> MapDataset:
-    assert len(bags) == len(targs), \
-        'number of bags and ground truths does not match!'
+    assert len(bags) == len(targs), 'number of bags and ground truths does not match!'
 
     ds = MapDataset(
         zip_bag_targ,
         BagDataset(bags, bag_size=bag_size),
-        EncodedDataset(target_enc, targs),
+        EncodedDataset(None, targs, target_type=target_type),  # Pass target_type here
     )
 
     return ds
@@ -295,7 +304,7 @@ def _attach_add_to_bag_and_zip_with_targ(bag, add, targ):
 
 def get_cohort_df(
     clini_table: Union[Path, str], slide_table: Union[Path, str], feature_dir: Union[Path, str],
-    target_label: str, categories: Iterable[str]
+    target_label: str
 ) -> pd.DataFrame:
     clini_df = pd.read_csv(clini_table, dtype=str) if Path(clini_table).suffix == '.csv' else pd.read_excel(clini_table, dtype=str)
     slide_df = pd.read_csv(slide_table, dtype=str) if Path(slide_table).suffix == '.csv' else pd.read_excel(slide_table, dtype=str)
@@ -314,7 +323,7 @@ def get_cohort_df(
     
     df = clini_df.merge(slide_df, on='PATIENT')
     # remove uninteresting
-    df = df[df[target_label].isin(categories)]
+    #df = df[df[target_label].isin(categories)]
     # remove slides we don't have
     h5s = set(feature_dir.glob('*.h5'))
     assert h5s, f'no features found in {feature_dir}!'

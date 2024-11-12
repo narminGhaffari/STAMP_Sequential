@@ -1,13 +1,7 @@
-"""
-In parts from https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/vit.py
-"""
-
 import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import repeat
-
-
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -16,8 +10,7 @@ class RMSNorm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.normalize(x, dim = -1) * self.scale * self.gamma
-
+        return F.normalize(x, dim=-1) * self.scale * self.gamma
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, norm_layer=nn.LayerNorm, dropout=0.):
@@ -34,44 +27,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.mlp(x)
 
-
-# class Attention(nn.Module):
-#     def __init__(self, dim, heads=8, dim_head=512 // 8, norm_layer=nn.LayerNorm, dropout=0.):
-#         super().__init__()
-#         inner_dim = dim_head * heads
-#         project_out = heads != 1 or dim_head != dim
-
-#         self.heads = heads
-#         self.scale = dim_head ** -0.5
-
-#         self.norm = norm_layer(dim)
-
-#         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-#         self.to_out = nn.Sequential(
-#             nn.Linear(inner_dim, dim),
-#             nn.Dropout(dropout)
-#         ) if project_out else nn.Identity()
-
-#     def forward(self, x, mask=None):
-#         x = self.norm(x)
-
-#         qkv = self.to_qkv(x).chunk(3, dim=-1)
-#         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
-#         dots = (q @ k.mT) * self.scale
-
-#         if mask is not None:
-#             mask_value = torch.finfo(dots.dtype).min
-#             dots.masked_fill_(mask, mask_value)
-
-#         # improve numerical stability of softmax
-#         dots = dots - torch.amax(dots, dim=-1, keepdim=True)
-#         attn = F.softmax(dots, dim=-1)
-
-#         out = attn @ v
-#         out = rearrange(out, 'b h n d -> b n (h d)')
-#         return self.to_out(out), attn
-
-
 class Attention(nn.Module):
     def __init__(self, dim, heads=8, dim_head=512 // 8, norm_layer=nn.LayerNorm, dropout=0.):
         super().__init__()
@@ -83,10 +38,9 @@ class Attention(nn.Module):
         if mask is not None:
             mask = mask.repeat(self.heads, 1, 1)
 
-        x = self.norm(x)        
+        x = self.norm(x)
         attn_output, _ = self.mhsa(x, x, x, need_weights=False, attn_mask=mask)
         return attn_output
-
 
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, norm_layer=nn.LayerNorm, dropout=0.):
@@ -107,56 +61,65 @@ class Transformer(nn.Module):
             x = ff(x) + x
         return self.norm(x)
 
-
-class TransMIL(nn.Module):
+class TransMILWithSequencePrediction(nn.Module):
     def __init__(self, *, 
-        num_classes: int, input_dim: int = 768, dim: int = 512,
-        depth: int = 2, heads: int = 8, dim_head: int = 64, mlp_dim: int = 2048,
-        pool: str ='cls', dropout: int = 0., emb_dropout: int = 0.
+        num_classes: int, sequence_length: int, input_dim: int = 1024, bag_size: int = 512,
+        dim: int = 512, depth: int = 2, heads: int = 8, dim_head: int = 64, mlp_dim: int = 2048,
+        lstm_hidden_dim: int = 256, lstm_layers: int = 1,
+        dropout: float = 0., emb_dropout: float = 0.
     ):
         super().__init__()
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
-        self.cls_token = nn.Parameter(torch.randn(dim))
+        
+        self.sequence_length = sequence_length
+        self.num_classes = num_classes
+        self.bag_size = bag_size
 
+        # Transform each feature vector in the bag
         self.fc = nn.Sequential(nn.Linear(input_dim, dim, bias=True), nn.GELU())
         self.dropout = nn.Dropout(emb_dropout)
 
+        # Transformer for feature extraction across the bag
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, nn.LayerNorm, dropout)
+        
+        # LSTM layer for autoregressive sequence prediction based on bag representation
+        self.lstm = nn.LSTM(input_size=dim + num_classes, hidden_size=lstm_hidden_dim, num_layers=lstm_layers, batch_first=True)
+        
+        # Final layer to produce predictions at each step
+        self.mlp_head = nn.Linear(lstm_hidden_dim, num_classes)
 
-        self.pool = pool
-        self.mlp_head = nn.Sequential(
-            nn.Linear(dim, num_classes)
-        )
-
-    def forward(self, x, lens):
-        # remove unnecessary padding
-        # (deactivated for now, since the memory usage fluctuates more and is overall bigger)
-        # x = x[:, :torch.max(lens)].contiguous()
+    def forward(self, x, lens=None):
+        # x has shape (batch_size, bag_size, input_dim), where bag_size = 512 and input_dim = 1024
         b, n, d = x.shape
 
-        # map input sequence to latent space of TransMIL
-        x = self.dropout(self.fc(x))
-
-        add_cls = self.pool == 'cls'
-        if add_cls:
-            cls_tokens = repeat(self.cls_token, 'd -> b 1 d', b=b)
-            x = torch.cat((cls_tokens, x), dim=1)
-            lens = lens + 1 # account for cls token
-
-        # mask indicating zero padded feature vectors
-        # (deactivated for now, since it seems to use more memory than without)
-        mask = None
-        if torch.amin(lens) != torch.amax(lens) and False:
-            mask = torch.arange(0, n + add_cls, dtype=torch.int32, device=x.device).repeat(b, 1) < lens[..., None]
-            mask = (~mask[:, None, :]).repeat(1, (n + add_cls), 1) # shape: (B, L, L)
-            # mask = (~mask[:, None, :]).expand(-1, (n + add_cls), -1)
-
-        x = self.transformer(x, mask)
-
-        if mask is not None and self.pool == 'mean':
-            x = torch.cumsum(x, dim=1)[torch.arange(b), lens - 1]
-            x = x / lens[..., None]
-        else:
-            x = x.mean(dim=1) if self.pool == 'mean' else x[:, 0]
+        # Map each feature vector in the bag to a lower-dimensional space
+        x = self.fc(x)  # Shape (batch_size, bag_size, dim)
         
-        return self.mlp_head(x)
+        # Pass through the Transformer to aggregate information across the bag
+        x = self.transformer(x)  # Shape remains (batch_size, bag_size, dim)
+        
+        # Mean pooling over the bag dimension to get a single representation per bag
+        x = x.mean(dim=1)  # Shape (batch_size, dim)
+
+        # Initialize LSTM hidden state
+        lstm_hidden = None
+
+        # Autoregressive feedback: iteratively pass predictions as input to the next step
+        predictions = []
+        prev_output = torch.zeros(b, 1, self.num_classes, device=x.device)  # Start with zeros for the initial prediction
+
+        for _ in range(self.sequence_length):
+            # Concatenate previous output with the bag representation
+            lstm_input = torch.cat((x.unsqueeze(1), prev_output), dim=-1)  # Shape (batch_size, 1, dim + num_classes)
+            
+            # Pass through LSTM
+            lstm_out, lstm_hidden = self.lstm(lstm_input, lstm_hidden)  # Shape (batch_size, 1, lstm_hidden_dim)
+            
+            # Predict for this time step
+            output = self.mlp_head(lstm_out.squeeze(1))  # Shape (batch_size, num_classes)
+            predictions.append(output)
+
+            # Update previous output for the next time step
+            prev_output = output.unsqueeze(1)  # Shape (batch_size, 1, num_classes)
+
+        # Stack predictions for the entire sequence
+        return torch.stack(predictions, dim=1)  # Shape (batch_size, sequence_length, num_classes)

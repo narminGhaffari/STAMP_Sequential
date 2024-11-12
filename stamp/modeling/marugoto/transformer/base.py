@@ -1,7 +1,3 @@
-from typing import Any, Iterable, Optional, Sequence, Tuple, TypeVar
-from pathlib import Path
-from functools import partial
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -15,20 +11,30 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from .data import make_dataset, SKLearnEncoder
-from .TransMIL import TransMIL
+from .TransMIL import TransMILWithSequencePrediction
 
+from typing import Any, Iterable, Optional, Sequence, Tuple, TypeVar
+from pathlib import Path
+from functools import partial
+from sklearn.metrics import roc_auc_score
 
+from fastai.callback.core import Callback
+
+class DebugCallback(Callback):
+    def after_epoch(self):
+        print(f"Metrics after epoch {self.epoch + 1}: {self.recorder.metrics}")
+        
 __all__ = ['train', 'deploy']
 
-
 T = TypeVar('T')
-
 
 def train(
     *,
     bags: Sequence[Iterable[Path]],
-    targets: Tuple[SKLearnEncoder, np.ndarray],
-    add_features: Iterable[Tuple[SKLearnEncoder, Sequence[Any]]] = [],
+    targets: Tuple[None, np.ndarray],  # Direct sequence of binary or categorical targets
+    sequence_length: int,  # Number of time steps in each target sequence
+    num_classes: int = 1,  # Number of classes for prediction at each time step (1 for binary classification)
+    add_features: Iterable = [],  # No additional features
     valid_idxs: np.ndarray,
     n_epoch: int = 32,
     patience: int = 8,
@@ -37,103 +43,114 @@ def train(
     cores: int = 8,
     plot: bool = False
 ) -> Learner:
-    """Train a MLP on image features.
-
-    Args:
-        bags:  H5s containing bags of tiles.
-        targets:  An (encoder, targets) pair.
-        add_features:  An (encoder, targets) pair for each additional input.
-        valid_idxs:  Indices of the datasets to use for validation.
-    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if device.type == "cuda":
-        # allow for usage of TensorFloat32 as internal dtype for matmul on modern NVIDIA GPUs
         torch.set_float32_matmul_precision("medium")
 
-    target_enc, targs = targets
+    # Directly access the target sequence values
+    _, targs = targets  # Expecting targs of shape (num_samples, sequence_length)
+    # Determine the target type based on the number of classes
+    target_type = torch.float32 if num_classes == 1 else torch.long
+
+    # Convert targs to the appropriate numpy type before creating the dataset
+    targs = targs.astype(np.float32 if target_type == torch.float32 else np.int64)
+
+    # Create datasets, specifying target_type
     train_ds = make_dataset(
         bags=bags[~valid_idxs],
-        targets=(target_enc, targs[~valid_idxs]),
-        add_features=[
-            (enc, vals[~valid_idxs])
-            for enc, vals in add_features],
-        bag_size=512)
+        targets=(targs[~valid_idxs]),
+        add_features=[],
+        bag_size=512,
+        target_type=target_type  # Pass target_type here
+    )
 
     valid_ds = make_dataset(
         bags=bags[valid_idxs],
-        targets=(target_enc, targs[valid_idxs]),
-        add_features=[
-            (enc, vals[valid_idxs])
-            for enc, vals in add_features],
-        bag_size=None)
-    
-    # build dataloaders
-    train_dl = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=cores,
-        drop_last=len(train_ds) > batch_size,
-        device=device, pin_memory=device.type == "cuda"
+        targets=(targs[valid_idxs]),
+        add_features=[],
+        bag_size=None,
+        target_type=target_type  # Pass target_type here
     )
-    valid_dl = DataLoader(
-        valid_ds, batch_size=1, shuffle=False, num_workers=cores,
-        device=device, pin_memory=device.type == "cuda"
-    )
-    batch = train_dl.one_batch()
-    feature_dim = batch[0].shape[-1]
 
-    # for binary classification num_classes=2
-    model = TransMIL(
-        num_classes=len(target_enc.categories_[0]), input_dim=feature_dim,
-        dim=512, depth=2, heads=8, mlp_dim=512, dropout=.0
-    )
-    # TODO:
-    # maybe increase mlp_dim? Not necessary 4*dim, but maybe a bit?
-    # maybe add at least some dropout?
+    # Build dataloaders
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=cores, device=device)
+    valid_dl = DataLoader(valid_ds, batch_size=1, shuffle=False, num_workers=cores, device=device)
+    dls = DataLoaders(train_dl, valid_dl, device=device)
+
+    # Initialize the model with sequence length and num_classes
+    feature_dim = train_ds[0][0].shape[-1]
+    model = TransMILWithSequencePrediction(
+        num_classes=num_classes, sequence_length=sequence_length, input_dim=1024, dim=512,
+        depth=2, heads=8, dim_head=64, mlp_dim=512, dropout=.0
+    ).to(device)
     
-    # model = torch.compile(model)
     model.to(device)
     print(f"Model: {model}", end=" ")
     print(f"[Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}]")
 
-    # weigh inversely to class occurrences
-    counts = pd.Series(targs[~valid_idxs]).value_counts()
-    weight = counts.sum() / counts
-    weight /= weight.sum()
-    # reorder according to vocab
-    weight = torch.tensor(
-        list(map(weight.get, target_enc.categories_[0])), dtype=torch.float32, device=device)
-    loss_func = nn.CrossEntropyLoss(weight=weight)
+    # Use a suitable loss function
+    loss_func = nn.BCEWithLogitsLoss() if num_classes == 1 else nn.CrossEntropyLoss()
 
-    dls = DataLoaders(train_dl, valid_dl, device=device)
+    class SequenceRocAuc:
+        def __init__(self):
+            self.name = "SequenceROC"
+            self.reset()
 
+        def reset(self):
+            self.preds = []
+            self.targets = []
+
+        def accumulate(self, preds, targs):
+            # Calculate probability for class 1 using sigmoid on logit differences
+            preds = torch.sigmoid(preds[:, :, 1] - preds[:, :, 0])  # Probability for class 1
+            preds = preds.flatten().cpu().numpy()  # Flatten to 1D array
+
+            # Flatten targets to 1D array
+            targs = targs.flatten().cpu().numpy()
+
+            # Accumulate for the entire batch
+            self.preds.extend(preds)
+            self.targets.extend(targs)
+
+        def value(self):
+            try:
+                # Compute ROC AUC using accumulated predictions and targets
+                score = roc_auc_score(self.targets, self.preds)
+                print(f"Calculated ROC-AUC score: {score}")  # Debugging line
+                return score
+            except ValueError:
+                print("ValueError in ROC calculation, returning NaN")  # Debugging line
+                return float("nan")
+
+        def __call__(self, preds, targs):
+            self.reset()
+            self.accumulate(preds, targs)
+            return self.value() or 0.0  # Ensure it never returns None
+
+
+    # Create fastai Learner with the custom metric for sequence ROC
     learn = Learner(
         dls,
         model,
         loss_func=loss_func,
-        opt_func = partial(OptimWrapper, opt=torch.optim.AdamW),
-        metrics=[RocAuc()],
+        opt_func=partial(OptimWrapper, opt=torch.optim.AdamW),
+        metrics=[SequenceRocAuc()],
         path=path,
-    )#.to_bf16()
+    )
 
+    # Callbacks for training
     cbs = [
         SaveModelCallback(monitor='valid_loss', fname=f'best_valid'),
         EarlyStoppingCallback(monitor='valid_loss', patience=patience),
-        CSVLogger(),
-        # MixedPrecision(amp_mode=AMPMode.BF16)
+        DebugCallback()
     ]
-    learn.fit_one_cycle(n_epoch=n_epoch, reset_opt=True, lr_max=1e-4, wd=1e-2, cbs=cbs)
+    print("Training with parameters:", {
+    "path": path,
+    "n_epoch": n_epoch,
+    "metrics": learn.metrics
+    })
     
-    # Plot training and validation losses as well as learning rate schedule
-    if plot:
-        path_plots = path / "plots"
-        path_plots.mkdir(parents=True, exist_ok=True)
-
-        learn.recorder.plot_loss()
-        plt.savefig(path_plots / 'losses_plot.png')
-        plt.close()
-
-        learn.recorder.plot_sched()
-        plt.savefig(path_plots / 'lr_scheduler.png')
-        plt.close()
+    learn.fit_one_cycle(n_epoch=n_epoch, reset_opt=True, lr_max=1e-4, wd=1e-2, cbs=cbs)
 
     return learn
 
@@ -145,9 +162,7 @@ def deploy(
     device: torch.device = torch.device('cpu')
 ) -> pd.DataFrame:
     assert test_df.PATIENT.nunique() == len(test_df), 'duplicate patients!'
-    #assert (len(add_label)
-    #        == (n := len(learn.dls.train.dataset._datasets[-2]._datasets))), \
-    #    f'not enough additional feature labels: expected {n}, got {len(add_label)}'
+
     if target_label is None: target_label = learn.target_label
     if cat_labels is None: cat_labels = learn.cat_labels
     if cont_labels is None: cont_labels = learn.cont_labels
@@ -172,34 +187,27 @@ def deploy(
         test_ds, batch_size=1, shuffle=False, num_workers=1,
         device=device, pin_memory=device.type == "cuda")
 
-    #removed softmax in forward, but add here to get 0-1 probabilities
-    patient_preds, patient_targs = learn.get_preds(dl=test_dl, act=nn.Softmax(dim=1))
+    # Sequential predictions
+    patient_preds, patient_targs = learn.get_preds(dl=test_dl, act=nn.Softmax(dim=2))
 
-    # make into DF w/ ground truth
+    # Convert predictions to DataFrame with the ground truth
     patient_preds_df = pd.DataFrame.from_dict({
         'PATIENT': test_df.PATIENT.values,
         target_label: test_df[target_label].values,
-        **{f'{target_label}_{cat}': patient_preds[:, i]
-            for i, cat in enumerate(categories)}})
+        **{f'{target_label}_{cat}_step_{i}': patient_preds[:, i, idx]
+            for i in range(patient_preds.size(1))
+            for idx, cat in enumerate(categories)}
+    })
 
-    # calculate loss
-    patient_preds = patient_preds_df[[
-        f'{target_label}_{cat}' for cat in categories]].values
-    patient_targs = target_enc.transform(
-        patient_preds_df[target_label].values.reshape(-1, 1))
+    # Calculate loss across sequences
+    patient_preds_flat = patient_preds.view(-1, patient_preds.size(-1))
+    patient_targs_flat = target_enc.transform(
+        test_df[target_label].values.reshape(-1, 1))
     patient_preds_df['loss'] = F.cross_entropy(
-        torch.tensor(patient_preds), torch.tensor(patient_targs),
-        reduction='none')
+        torch.tensor(patient_preds_flat), torch.tensor(patient_targs_flat),
+        reduction='none').view(patient_preds.size(0), -1).mean(1)
 
-    patient_preds_df['pred'] = categories[patient_preds.argmax(1)]
-
-    # reorder dataframe and sort by loss (best predictions first)
-    patient_preds_df = patient_preds_df[[
-        'PATIENT',
-        target_label,
-        'pred',
-        *(f'{target_label}_{cat}' for cat in categories),
-        'loss']]
-    patient_preds_df = patient_preds_df.sort_values(by='loss')
+    # Add a column for final prediction (could be a custom post-processing)
+    patient_preds_df['pred'] = categories[patient_preds[:, -1, :].argmax(1)]
 
     return patient_preds_df

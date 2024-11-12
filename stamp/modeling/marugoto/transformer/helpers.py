@@ -22,7 +22,15 @@ __all__ = [
 
 PathLike = Union[str, Path]
 
-
+# Convert tuple keys to strings recursively
+def convert_keys_to_strings(obj):
+    if isinstance(obj, dict):
+        return {str(k) if isinstance(k, tuple) else k: convert_keys_to_strings(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_keys_to_strings(i) for i in obj]
+    else:
+        return obj
+    
 class IncompatibleVersionError(Exception):
     """Exception raised for loading a model with an incompatible version."""
     pass
@@ -96,12 +104,12 @@ def train_categorical_model_(
     df = df.dropna(subset=target_label)
 
     # TODO move into get_cohort_df
-    if not categories:
-        categories = df[target_label].unique()
-    categories = np.array(categories)
-    info['categories'] = list(categories)
+    #if not categories:
+    #    categories = df[target_label].unique()
+    #categories = np.array(categories)
+    #info['categories'] = list(categories)
 
-    df = get_cohort_df(clini_table, slide_table, feature_dir, target_label, categories)
+    df = get_cohort_df(clini_table, slide_table, feature_dir, target_label)
 
     print('Overall distribution')
     print(df[target_label].value_counts())
@@ -285,37 +293,52 @@ def categorical_crossval_(
     # filter na, infer categories if not given
     df = df.dropna(subset=target_label)
 
-    if not categories:
-        categories = df[target_label].unique()
-    categories = np.array(categories)
-    info['categories'] = list(categories)
+    sequence_length = len(target_label)
+    num_classes = len(np.unique(df[target_label].values.flatten()))  # Assuming binary (0,1) or categorical targets
 
-    df = get_cohort_df(clini_table, slide_table, feature_dir, target_label, categories)
 
+    df = get_cohort_df(clini_table, slide_table, feature_dir, target_label)
+    df = df.dropna(subset=target_label)
+    patient_ids = df['PATIENT'].unique()
+
+    # Class distribution information
     info['class distribution'] = {'overall': {
         k: int(v) for k, v in df[target_label].value_counts().items()}}
 
-    target_enc = OneHotEncoder(sparse_output=False).fit(categories.reshape(-1, 1))
-
-    if (fold_path := output_path/'folds.pt').exists():
+    # Check if folds already exist
+    if (fold_path := output_path / 'folds.pt').exists():
         folds = torch.load(fold_path)
     else:
-        #added shuffling with seed 1337
+        # Initialize StratifiedKFold with shuffle
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=1337)
-        patient_df = df.groupby('PATIENT').first().reset_index()
-        folds = tuple(skf.split(patient_df.PATIENT, patient_df[target_label]))
+        
+        # Group by patient and create unique target encoding for stratification
+        df[target_label] = df[target_label].astype(int)
+        targets_concat = df.groupby('PATIENT')[target_label].first()
+        targets_concat = sum(targets_concat[col] * (10 ** i) for i, col in enumerate(reversed(target_label)))
+
+        # Generate folds based on `df` directly
+        folds = tuple(skf.split(patient_ids, targets_concat))
         torch.save(folds, fold_path)
 
+    # Create info on folds, ensuring patient IDs match those in `df`
     info['folds'] = [
         {
-            part: list(df.PATIENT[folds[fold][i]])
+            part: list(df[df.PATIENT.isin(patient_ids[folds[fold][i]])].PATIENT)
             for i, part in enumerate(['train', 'test'])
         }
-        for fold in range(n_splits) ]
+        for fold in range(n_splits)
+    ]
 
-    with open(output_path/'info.json', 'w') as f:
-        json.dump(info, f)
+    # Convert keys in `info` and save as JSON
+    info_json_compatible = convert_keys_to_strings(info)
 
+    # Write to JSON file
+    with open(output_path / 'info.json', 'w') as f:
+        json.dump(info_json_compatible, f)
+    
+    #target_enc = {'categories_': [np.array([0, 1])]}
+    
     for fold, (train_idxs, test_idxs) in enumerate(folds):
         print(f"\nFold: {fold+1}/{n_splits}")
         fold_path = output_path/f'fold-{fold}'
@@ -328,8 +351,9 @@ def categorical_crossval_(
             fold_train_df = df.iloc[train_idxs]
             learn = _crossval_train(
                 fold_path=fold_path, fold_df=fold_train_df, fold=fold, info=info,
-                target_label=target_label, target_enc=target_enc,
-                cat_labels=cat_labels, cont_labels=cont_labels)
+                target_label=target_label, cat_labels=cat_labels, cont_labels=cont_labels,
+                sequence_length=sequence_length, num_classes=num_classes
+            )
             learn.export()
 
         fold_test_df = df.iloc[test_idxs]
@@ -342,7 +366,7 @@ def categorical_crossval_(
 
 
 def _crossval_train(
-    *, fold_path, fold_df, fold, info, target_label, target_enc, cat_labels, cont_labels
+    *, fold_path, fold_df, fold, info, target_label, cat_labels, cont_labels, sequence_length, num_classes
 ):
     """Helper function for training the folds."""
     assert fold_df.PATIENT.nunique() == len(fold_df)
@@ -366,14 +390,14 @@ def _crossval_train(
     add_features = []
     if cat_labels: add_features.append((_make_cat_enc(train_df, cat_labels), fold_df[cat_labels].values))
     if cont_labels: add_features.append((_make_cont_enc(train_df, cont_labels), fold_df[cont_labels].values))
-
+    
     learn = train(
         bags=fold_df.slide_path.values,
-        targets=(target_enc, fold_df[target_label].values),
-        add_features=add_features,
+        targets=(None, fold_df[target_label].values),
+        sequence_length=sequence_length,
+        num_classes=num_classes,
         valid_idxs=fold_df.PATIENT.isin(valid_patients),
-        path=fold_path,
-        cores=max(1, os.cpu_count() // 4)
+        path=fold_path
     )
     learn.target_label = target_label
     learn.cat_labels, learn.cont_labels = cat_labels, cont_labels

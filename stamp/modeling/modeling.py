@@ -1,17 +1,20 @@
 import argparse
 from pathlib import Path
 
-from .marugoto.transformer.helpers import train_categorical_model_, deploy_categorical_model_, categorical_crossval_
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath('/mnt/bulk-ganymede/narmin/narmin/Chiara_Project/STAMP_Sequential'))
+from stamp.modeling.marugoto.transformer.helpers import train_categorical_model_, deploy_categorical_model_, categorical_crossval_
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Associative modeling with a Vision Transformer.')
     
-    parser.add_argument("--clini_table", type=Path, help="Path to clini_excel file")
-    parser.add_argument("--slide_table", type=Path, help="Path to slide_table file")
-    parser.add_argument("--feature_dir", type=Path, help="Path to feature directory")
-    parser.add_argument("--output_path", type=Path, help="Path to output file")
-    parser.add_argument("--target_label", type=str, help="Target label")
+    parser = argparse.ArgumentParser(description='Associative modeling with a Vision Transformer.')
+    parser.add_argument("--clini_table", type=Path, default = '/mnt/bulk-ganymede/narmin/narmin/Chiara_Project/Data/GALAXY_CLINI_Sequential.xlsx', help="Path to clini_excel file")
+    parser.add_argument("--slide_table", type=Path, default = '/mnt/bulk-ganymede/narmin/narmin/Chiara_Project/Data/GALAXY_SLIDE_DX.csv', help="Path to slide_table file")
+    parser.add_argument("--feature_dir", type=Path, default = '/mnt/bulk-ganymede/narmin/narmin/Chiara_Project/Data/GALAXY_Features', help="Path to feature directory")
+    parser.add_argument("--output_path", type=Path, default = '/mnt/bulk-ganymede/narmin/narmin/Chiara_Project/Experiments/test', help="Path to output file")
+    parser.add_argument("--target_label", type=list, default = ['Final_Result_initial', 'Final_Result_4w'], help="Target label")
     parser.add_argument("--cat_labels", type=str, nargs="+", default=[], help="Category labels")
     parser.add_argument("--cont_labels", type=str, nargs="+", default=[], help="Continuous labels")
     parser.add_argument("--categories", type=str, nargs="+", default=None, help="Categories")
